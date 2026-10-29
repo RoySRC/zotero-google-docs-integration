@@ -50,7 +50,8 @@ Zotero.GoogleDocs.API = {
 			delete Zotero.GoogleDocs.API.authCredentials.headers;
 		}
 		if (Zotero.GoogleDocs.API.authCredentials.headers) {
-			return Zotero.GoogleDocs.API.authCredentials.headers;
+			// Return a copy so callers can add headers without mutating persisted credentials
+			return { ...Zotero.GoogleDocs.API.authCredentials.headers };
 		}
 		
 		// For macOS, since popping up an auth window or calling Connector_Browser.bringToFront()
@@ -145,7 +146,7 @@ Zotero.GoogleDocs.API = {
 			&& Zotero.GoogleDocs.API.authDeferred.reject(error);
 	},
 	
-	run: async function(documentSpecifier, method, args, tab) {
+	run: async function(documentSpecifier, method, args, tab, isAuthRetry=false) {
 		// If not an array, discard or the docs script spews errors.
 		if (! Array.isArray(args)) {
 			args = [];
@@ -161,7 +162,13 @@ Zotero.GoogleDocs.API = {
 			var xhr = await Zotero.HTTP.request('POST', ZOTERO_CONFIG.GOOGLE_DOCS_API_URL,
 				{headers, body, timeout: null});
 		} catch (e) {
-			if (e.status >= 400 && e.status < 404) {
+			// Access token rejected before its recorded expiry (revoked, signed out, etc.)
+			// Drop it and retry once, which will trigger reauthorization
+			if (e.status == 401 && !isAuthRetry) {
+				delete this.authCredentials.headers;
+				return this.run(documentSpecifier, method, args, tab, true);
+			}
+			if (e.status == 403) {
 				this.resetAuth();
 				this.displayWrongAccountPrompt();
 				throw new Error('Handled Error');
@@ -264,7 +271,7 @@ Zotero.GoogleDocs.API = {
 		Zotero.Connector_Browser.openTab('https://www.zotero.org/support/google_docs#authorization');
 	},
 
-	getDocument: async function (docID, documentTabId=null, browserTab=null) {
+	getDocument: async function (docID, documentTabId=null, browserTab=null, isAuthRetry=false) {
 		var headers = await this.getAuthHeaders(browserTab);
 		headers["Content-Type"] = "application/json";
 		try {
@@ -273,6 +280,12 @@ Zotero.GoogleDocs.API = {
 
 			delete Zotero.GoogleDocs.API.V2BrokenDocsById[docID];
 		} catch (e) {
+			// Access token rejected before its recorded expiry (revoked, signed out, etc.)
+			// Drop it and retry once, which will trigger reauthorization
+			if (e.status == 401 && !isAuthRetry) {
+				delete this.authCredentials.headers;
+				return this.getDocument(docID, documentTabId, browserTab, true);
+			}
 			if (e.status == 403) {
 				this.resetAuth();
 				this.displayWrongAccountPrompt();
@@ -318,18 +331,19 @@ Zotero.GoogleDocs.API = {
 		let document = JSON.parse(xhr.responseText);
 		if (!document.tabs) return document;
 		let documentTab = this._getDocumentTabFromTabs(document.tabs, documentTabId);
-		if (documentTab) {
-			documentTab.documentId = docID;
-			documentTab.tabId = documentTabId;
-			documentTab.revisionId = document.revisionId;
+		if (!documentTab) {
+			throw new Error(`Google Docs tab ${documentTabId} not found in document`);
 		}
+		documentTab.documentId = docID;
+		documentTab.tabId = documentTabId;
+		documentTab.revisionId = document.revisionId;
 		return documentTab;
 	},
 	
 	_getDocumentTabFromTabs: function(tabs, tabId=null) {
 		for (let tab of tabs) {
 			// Return first tab if not specified
-			if (tabId === null || tab.tabProperties.tabId == tabId) {
+			if (!tabId || tab.tabProperties.tabId == tabId) {
 				return tab.documentTab;
 			}
 			if (tab.childTabs) {
@@ -364,8 +378,9 @@ Zotero.GoogleDocs.API = {
 		return hashHex;
 	},
 
-	batchUpdateDocument: async function (docId, documentTabId=null, body, browserTab=null) {
+	batchUpdateDocument: async function (docId, documentTabId=null, body, browserTab=null, isAuthRetry=false) {
 		var headers = await this.getAuthHeaders(browserTab);
+		headers["Content-Type"] = "application/json";
 		if (documentTabId) {
 			for (let request of body.requests) {
 				request = this._addTabDataToObject(request, documentTabId);
@@ -375,6 +390,12 @@ Zotero.GoogleDocs.API = {
 			var xhr = await Zotero.HTTP.request('POST', `https://docs.googleapis.com/v1/documents/${docId}:batchUpdate`,
 				{headers, body, timeout: 60000});
 		} catch (e) {
+			// Access token rejected before its recorded expiry (revoked, signed out, etc.)
+			// Drop it and retry once, which will trigger reauthorization
+			if (e.status == 401 && !isAuthRetry) {
+				delete this.authCredentials.headers;
+				return this.batchUpdateDocument(docId, documentTabId, body, browserTab, true);
+			}
 			if (e.status == 403) {
 				this.resetAuth();
 				this.displayWrongAccountPrompt();
